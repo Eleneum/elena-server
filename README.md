@@ -16,7 +16,7 @@ After installing MongoDB, follow these steps:
 ```bash
 sudo apt-get update
 sudo apt-get install python3-pip git cmake screen
-pip3 install pymongo pycryptodomex web3 ethereum
+pip3 install pymongo pycryptodomex web3 ethereum==2.3.2 rlp==1.2.0
 pip3 install git+https://github.com/Eleneum/pyrx
 ```
 
