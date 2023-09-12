@@ -32,3 +32,5 @@ python3 eleneum.py
 ```
 
 This will keep the program running even if you disconnect from the terminal. To detach from the screen session, press Ctrl+A followed by Ctrl+D.
+
+At the moment, the server is using port 9090, and it cannot be changed. However, I will be adding the option to change it in future versions (which I don't expect to take too long).
