@@ -33,9 +33,8 @@ from decimal import Decimal
 import math
 
 w3 = Web3()
-sender_private_key = 'YOUR_PRIVATE_KEY_HERE'
-sender_account = Account.from_key(sender_private_key)
-sender_address = sender_account.address
+sender_private_key = ''
+sender_address = ''
 base_diff = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 assert pyrx.__version__ >= '0.0.3'
 dbmongo = 'mongodb://127.0.0.1:27017'
@@ -46,6 +45,7 @@ blocks = bcdb["blocks"]
 txs = bcdb["transactions"]
 mempool = bcdb["mempool"]
 balances = bcdb["balances"]
+backup = bcdb["backup"]
 logs = bcdb["logs"]
 evm_contracts = bcdb['evm_contracts']
 evm_memory = bcdb['evm_memory']
@@ -54,11 +54,7 @@ evm_logs = bcdb['evm_logs']
 evm_transactions = bcdb['evm_transactions']
 actualblock = 0
 open_sockets = {}
-
-
-
-
-
+peer_threads = {}
 # Define the indexes you want to create
 indices_blocks = [
     [("height", pymongo.ASCENDING)],
@@ -79,7 +75,33 @@ indices_transactions = [
     [("txinfo.value", pymongo.ASCENDING)],
 ]
 
-# Function to create indexes if they don't exist
+def load_config(filename):
+    global sender_private_key
+    global sender_address
+    try:
+        with open(filename, "r") as file:
+            data = json.load(file)
+    except FileNotFoundError:
+        print("Error: File " + str(filename) + " not exists")
+        exit(1)
+    except json.JSONDecodeError as e:
+        print("Error: File " + str(filename) + " is not valid")
+        exit(1)
+
+    if 'private_key' not in data:
+        print("Error: File " + str(filename) + " does not contains any private key")
+        exit(1)
+
+    try:
+        sender_private_key = data['private_key']
+        sender_account = Account.from_key(sender_private_key)
+        sender_address = sender_account.address
+    except Exception as e:
+        print("Error: File " + str(filename) + " contains an invalid private key")
+        exit(1)
+    
+    print("Eleneum server started with address: " + sender_address)
+
 def create_indexes(collection, indexes):
     for index in indexes:
         try:
@@ -87,6 +109,20 @@ def create_indexes(collection, indexes):
             print(f"Index {index} created successfully.")
         except pymongo.errors.OperationFailure:
             print(f"Index {index} already exists, not created.")
+
+def peer_monitor():
+    while True:
+        new_peers = []
+        for peer in peers.find():
+            server = peer['ip']
+            if server not in peer_threads:
+                new_thread = threading.Thread(target=launch_socket_client, args=(server,))
+                peer_threads[server] = new_thread
+                new_thread.start()
+                new_peers.append(server)
+        if new_peers:
+            print(f"New peers registered: {', '.join(new_peers)}")
+        time.sleep(10)
 
 def check_elena_balance(sender, value):
     balance = balances.find_one({"account": sender})
@@ -312,31 +348,65 @@ def evm(pblock):
     evm_internal.update_one({"info": "lastscannedblock"}, {"$set": {"value": int(pblock)}})
     print(str(time.time()) + "EVM processed: " + str(txpc) + " transactions")
 
+def socket_monitor_thread(client_thread, server):
+    lastc = 0
+    slastc = 300
+    while True:
+        if not client_thread.is_alive():
+            lastc = slastc
+            slastc = int(time.time())
+            client_thread = threading.Thread(target=http_client, args=(server,))
+            client_thread.start()
+        if lastc + 10 > slastc:
+            time.sleep(30)
+        else:
+            time.sleep(1)
 
+def launch_socket_client(server):
+    client_thread = threading.Thread(target=http_client, args=(server,))
+    client_thread.daemon = True
+    client_thread.start()
+    
+    m_thread = threading.Thread(target=socket_monitor_thread, args=(client_thread,server,))
+    m_thread.daemon = True
+    m_thread.start()   
 
+def register_peer(server):
+    hdata = "313.01"
+    url = "http://" + server + ":9090/registerpeer"
+    response = requests.post(url, data=hdata, timeout=5)
 
-def socket_client(server):
+def http_client(server):
     global actualblock
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tsocket:
-            tsocket.connect((server, 5566))
-            print("Socket to " + str(server) + ":5566 open")
-
-            while True:
-                m = tsocket.recv(1024).decode('utf-8')
-                if not m:
-                    print("Connection closed by remote end.")
-                    return
-                if int(m) > actualblock:
-                    print("[worker] " + str(int(time.time())) + " New block candidate received: " + str(m))
-                    hdata = str(server)
-                    url = "http://localhost:9090/syncbc"
-                    response = requests.post(url, data=hdata)
+    last_id = actualblock
+    last_mempool = 0
+    mempooltxs = 0
+    while True:
+        try:
+            t = int(time.time())
+            if actualblock != last_id:
+                hdata = str(actualblock)
+                url = "http://" + server + ":9090/notifyblock"
+                response = requests.post(url, data=hdata, timeout=5)
+                last_id = actualblock
+            if t != last_mempool and t % 60 == 0:
+                last_mempool = t
+                mempooltxs = 0
+                url = "http://" + server + ":9090/getmempool"
+                response = requests.get(url, timeout=5)
+                data = response.json()
+                results = data['result']
+                for tx in results:
+                    mempooltxs += 1
+                    hdata = str(tx['rawtx'])
+                    url = "http://localhost:9090/addtransaction"
+                    response = requests.post(url, data=hdata, timeout=2)
+                if mempooltxs > 0:
+                    print("[worker] " + str(int(time.time())) +  " Mempool processed: " + str(mempooltxs) + " txs from " + str(server))
+            time.sleep(0.5)
+        except Exception as e:
+            time.sleep(30)
             return
-        return
-    except Exception as e:
-        print("Error:", e)
-        return
 
 def rollback_block(height):
     print("[worker] " + str(int(time.time())) + "Rollback block: " + str(height))
@@ -348,6 +418,8 @@ def rollback_block(height):
         print("[worker] " + str(int(time.time())) +  " Transacction removed: " + str(int(tx.txinfo['value'])/1000000000000000000) + " ELEN, Hash: " + str(tx.txinfo['hash']))
         logs.delete_many({'hash': tx.txinfo['hash']})
         txs.delete_many({'rawtx': tx.rawtx})
+    bkp = blocks.find_one({'height': height})
+    backup.insert_one(bkp)
     blocks.delete_many({'height': height})
 
 def check_and_convert(data):
@@ -419,7 +491,7 @@ def sync_blockchain(force, server):
         if force == 0:
             try:
                 url = "http://" + server + ":9090/getminingtemplate"
-                response = requests.get(url)
+                response = requests.get(url, timeout=5)
                 data = response.json()
                 theight = data['height']
             except ValueError as e:
@@ -433,21 +505,25 @@ def sync_blockchain(force, server):
             if (data != previous_data and height < theight) or force == 1:  # Comparar los datos con los previos
                 hdata = str(height)
                 url = "http://" + server + ":9090/getblocks"
-                response = requests.post(url, data=hdata)
+                response = requests.post(url, data=hdata, timeout=5)
                 data = response.json()
                 results = data['result']
                 for block in results:
                     if(prevhash == block['prev_hash'] and timestamp <= int(block['timestamp'])):
                         hblock = Block(block['height'], block['prev_hash'], block['transactions'], block['public_key'], int(block['timestamp']))
-                        hblock.syncblock(block['hash'], block['nonce'], block['extranonce'], block['difficulty'], block['rewardtx'])
-                        #print(str(time.time()) + " Block found and inserted. Height: " + str(block['height']))
+                        
+                        if 'sign' not in block:
+                            block['sign'] = ''
+                        
+                        hblock.syncblock(block['hash'], block['nonce'], block['extranonce'], block['difficulty'], block['rewardtx'], block['sign'])
                         if len(block['transactions']) > 0:
                             evm(int(block['height']))
                         prevhash = block['hash']
                         actualblock = int(block['height'])
+                        
                     else:
                         print("[worker] " + str(int(time.time())) +  " Invalid block found. Height: " + str(block['height']))
-                        if height <= block['height']:
+                        if height <= block['height'] and prevhash != block['prev_hash']:
                             rollback_block(int(height)-1)
                         break
                 print("[worker] " + str(int(time.time())) +  " Block found and inserted. Height: " + str(block['height']))
@@ -456,14 +532,14 @@ def sync_blockchain(force, server):
                     break
             else:
                 actualblock = int(height)-1
-                print("[worker] " + str(int(time.time())) +  " Blockchain fully synced. Height: " + str(height))
+                print("[worker] " + str(int(time.time())) +  " Blockchain fully synced. Height: " + str(actualblock))
                 break
         except ValueError as e:
             print("[worker] " + str(time.time()) + ", Sync error. Maybe blockchain is fully synced...");
             break
         except Exception as e:
             if force == 0:
-                print("[worker] " + str(time.time()) + ", Peer error connection, closing connection...")
+                print("[worker] " + str(time.time()) + ", Peer error connection, closing connection..." + str(e))
             else:
                 print("[worker] " + str(time.time()) + ", Blockchain fully synced")
             break
@@ -562,6 +638,10 @@ class Block:
         return round(reward, 8)
         
     def process_mempool(self):
+        processed = 0
+        duplicated = 0
+        pvalue = 0
+        dvalue = 0
         for txn in mempool.find():
             tx = Tx(txn['rawtx'])
             if tx.check_balance() == True:
@@ -570,18 +650,29 @@ class Block:
                     self.transactions.append(tx.rawtx)
                     add_or_update_balance(tx.txinfo['to'], tx.txinfo['value'])
                     add_or_update_balance(tx.txinfo['sender'], str((int(tx.txinfo['value']) + (int(tx.txinfo['gasprice'])*int(tx.txinfo['startgas']))) * -1))
-                    print("[miner] " + str(int(time.time())) +  " Transacction processed: " + str(int(tx.txinfo['value'])/1000000000000000000) + " ELEN, Hash: " + str(tx.txinfo['hash']))
+                    processed += 1
+                    pvalue += int(tx.txinfo['value'])
+                    #print("[miner] " + str(int(time.time())) +  " Transacction processed: " + str(int(tx.txinfo['value'])/1000000000000000000) + " ELEN, Hash: " + str(tx.txinfo['hash']))
                     log = {"tx": str(tx.txinfo['hash']), "block": self.height, "status": "ok", "action": "inserted"}
                     logs.insert_one(log)
                 else:
-                    print("[miner] " + str(int(time.time())) +  " Transacction duplicated, Hash: " + str(tx.txinfo['hash']))
+                    duplicated += 1
+                    dvalue += int(tx.txinfo['value'])
+                    #print("[miner] " + str(int(time.time())) +  " Transacction duplicated, Hash: " + str(tx.txinfo['hash']))
                     log = {"tx": str(tx.txinfo['hash']), "block": self.height, "status": "deplicated", "action": "reverted"}
                     logs.insert_one(log)
                 mempool.delete_many({'rawtx': tx.rawtx})
+        mempool.delete_many({})
+        if processed > 0:
+            print("[miner] " + str(int(time.time())) +  " Transacction processed: " + str(processed) + ", Total value: " + str(int(pvalue)/1000000000000000000) + " ELENA")
+        if duplicated > 0:
+            print("[miner] " + str(int(time.time())) +  " Transacction not processed: " + str(duplicated) + ", Total value: " + str(int(dvalue)/1000000000000000000) + " ELENA")
 
     def get_diff(self):
         offset = 16
-        if self.height > offset:
+        if self.height == 1:
+            diff = 0
+        elif self.height > offset:
             a = blocks.find(sort=[("height", -1)]).limit(offset)
             dsum = sum(doc["difficulty"] for doc in a)
             dsum = math.ceil(dsum / offset)
@@ -592,9 +683,9 @@ class Block:
             if t != 0:
                 diff = math.ceil((dsum*offset*blocktime)/t)
             else:
-                diff = 1000
+                diff = 25000000
         else:
-            diff = 1000
+            diff = 25000000
         return diff
         
     def get_seed(self):
@@ -632,16 +723,47 @@ class Block:
         rewardhash = self.create_reward_transaction()
         blob = "0000" + self.prev_hash + hdiff + "00000000" + rewardhash
         return blob
-
-    def syncblock(self, blockhash, nonce, extranonce, difficulty, rewardtx):
+        
+    def syncblock(self, blockhash, nonce, extranonce, difficulty, rewardtx, sign):
+        processed = 0
+        duplicated = 0
+        pvalue = 0
+        dvalue = 0
+        
         self.nonce = nonce
         self.extranonce = extranonce
         self.rewardtx = rewardtx
+        self.sign = sign
+        
         if int(self.get_diff()) == int(difficulty):
             self.difficulty = difficulty
         else:
-            self.difficulty = difficulty
+            print("[miner] " + str(int(time.time())) +  " Invalid block difficulty, can't sync with this blockchain")
+            return
+
         rwtxa = Tx(self.rewardtx)
+        expectedreward = w3.to_wei(self.get_reward(), 'ether')
+        if int(rwtxa.txinfo['value']) != int(expectedreward):
+            print("[miner] " + str(int(time.time())) +  " Invalid reward value, can't sync with this blockchain")
+            return
+            
+        if self.sign_verify == False:
+            print("[miner] " + str(int(time.time())) +  " Invalid block signature, can't sync with this blockchain")
+            return
+        
+        seed = self.get_seed()
+        hdiff = hex(self.difficulty)[2:].zfill(10)
+        rewardhash = rwtxa.txinfo['hash'][2:]
+        blob = self.extranonce + self.prev_hash + hdiff + "00000000" + rewardhash
+        hex_hash = compute_hash(blob, nonce, seed, self.height)
+        hash_bytes = bytes.fromhex(hex_hash.decode())
+        hash_array = to_byte_array(hash_bytes)[::-1]
+        hash_num = int.from_bytes(bytes(hash_array), byteorder='big')
+        hash_diff = base_diff / hash_num
+        if hash_diff < self.difficulty:
+            print("[miner] " + str(int(time.time())) +  " Invalid nonce, block difficulty too low, can't sync with this blockchain")
+            return
+
         rwtxn = rwtxa.add_to_blockchain(0, self.height, self.timestamp)
         add_or_update_balance(self.public_key, str(w3.to_wei(self.get_reward(), 'ether')))
         self.hash = blockhash
@@ -652,14 +774,23 @@ class Block:
                 if rn == True:
                     add_or_update_balance(tx.txinfo['to'], tx.txinfo['value'])
                     add_or_update_balance(tx.txinfo['sender'], str((int(tx.txinfo['value']) + (int(tx.txinfo['gasprice'])*int(tx.txinfo['startgas']))) * -1))
-                    print("[miner] " + str(int(time.time())) +  " Transacction processed: " + str(int(tx.txinfo['value'])/1000000000000000000) + " ELEN, Hash: " + str(tx.txinfo['hash']))
+                    #print("[miner] " + str(int(time.time())) +  " Transacction processed: " + str(int(tx.txinfo['value'])/1000000000000000000) + " ELEN, Hash: " + str(tx.txinfo['hash']))
+                    processed += 1
+                    pvalue += int(tx.txinfo['value'])
                     log = {"tx": str(tx.txinfo['hash']), "block": self.height, "status": "ok", "action": "inserted"}
                     logs.insert_one(log)
                 else:
-                    print("[miner] " + str(int(time.time())) +  " Transacction duplicated, Hash: " + str(tx.txinfo['hash']))
+                    #print("[miner] " + str(int(time.time())) +  " Transacction duplicated, Hash: " + str(tx.txinfo['hash']))
+                    duplicated += 1
+                    dvalue += int(tx.txinfo['value'])
                     log = {"tx": str(tx.txinfo['hash']), "block": self.height, "status": "deplicated", "action": "reverted"}
                     logs.insert_one(log)
                 mempool.delete_many({'rawtx': tx.rawtx})
+        if processed > 0:
+            print("[miner] " + str(int(time.time())) +  " Transacction processed: " + str(processed) + ", Total value: " + str(int(pvalue)/1000000000000000000) + " ELENA")
+        if duplicated > 0:
+            print("[miner] " + str(int(time.time())) +  " Transacction not processed: " + str(duplicated) + ", Total value: " + str(int(dvalue)/1000000000000000000) + " ELENA")
+
         self.add_to_db()
 
     def mine(self, nonce, extranonce):
@@ -698,6 +829,30 @@ class Block:
             print(e)
             traceback.print_exc()
 
+    def sign_verify(self):
+        try:
+            pkey = self.public_key
+            signature_hash = self.sign
+            try:
+                del self.sign
+            except:
+                pass
+            try:
+                del self._id
+            except:
+                pass
+            print(signature_hash)
+            block_string = json.dumps(self.__dict__, sort_keys=True)
+            block_hash = hashlib.sha3_256(block_string.encode()).hexdigest()
+            message = messages.encode_defunct(hexstr=block_hash)
+            is_valid = Account.recover_message(message, signature=signature_hash) == pkey
+            if is_valid:
+                self.sign = signature_hash
+            return is_valid
+        except Exception as e:
+            print(e)
+            traceback.print_exc()
+
     def add_to_db(self):
         blocks.insert_one(self.__dict__)
 
@@ -714,6 +869,14 @@ class S(BaseHTTPRequestHandler):
             self._set_response()
             resp = '{"version": "1.0", "height": ' + str(actualblock) + '}'
             self.wfile.write(resp.encode('utf-8'))
+        if str(self.path) == "/getmempool":
+            self._set_response()
+            results = mempool.find()
+            result_list = []
+            for result in results:
+                result_list.append(result)
+            json_output = json.loads(json_util.dumps({"id": 1, "status": "ok", "result": result_list}))
+            self.wfile.write(json.dumps(json_output).encode('utf-8'))
         if str(self.path) == "/getminingtemplate":
             z = blocks.find_one(sort=[("height", -1)])
             try:
@@ -739,6 +902,25 @@ class S(BaseHTTPRequestHandler):
         global actualblock
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
+        if str(self.path) == "/registerpeer":
+            post_data = post_data.decode('utf-8')
+            self._set_response()
+            self.wfile.write("{status: 'ok'}".encode('utf-8'))
+            if post_data == "313.01":
+                data = {
+                    'ip': str(self.client_address[0]),
+                    'port': '9090',
+                    'status': 'ok'
+                }
+                mfilter = {'ip': str(self.client_address[0])}
+                peers.update_one(mfilter, {'$set': data}, upsert=True)
+        if str(self.path) == "/notifyblock":
+            post_data = post_data.decode('utf-8')
+            block = int(post_data)
+            self._set_response()
+            self.wfile.write("{status: 'ok'}".encode('utf-8'))
+            if actualblock < block:
+                sync_blockchain(1, self.client_address[0])
         if str(self.path) == "/syncbc":
             post_data = post_data.decode('utf-8')
             self._set_response()
@@ -814,77 +996,25 @@ def run(server_class=HTTPServer, handler_class=S, port=9090):
     httpd.server_close()
     print("[worker] " + str(int(time.time())) +  'Stopping httpd...')
 
-def socket_monitor_thread(client_thread, server):
-    lastc = 0
-    slastc = 300
-    while True:
-        if not client_thread.is_alive():
-            lastc = slastc
-            slastc = int(time.time())
-            client_thread = threading.Thread(target=socket_client, args=(server,))
-            client_thread.start()
-        if lastc + 10 > slastc:
-            time.sleep(30)
-        else:
-            time.sleep(1)
-
-def server_socket():
-    global open_sockets
-    port = 5566
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(('0.0.0.0', port))
-    s.listen(50)
-    print(f'COM on port {port}')
-
-    while True:
-        conn, addr = s.accept()
-        open_sockets[conn] = 1
-        print(len(open_sockets))
-
-def process_server_sockets():
-    global open_sockets
-    global actualblock
-    last_sent_block = 0
-    
-    print("[worker] " + str(int(time.time())) + "ZMQ server started...")
-    while True:
-        if int(actualblock) != int(last_sent_block):
-            sockets = list(open_sockets.keys()) 
-            clients = 0
-            last_sent_block = actualblock
-            for sock in sockets:
-                try:
-                    newjob = str(actualblock)
-                    sock.sendall(newjob.encode('utf-8'))
-                    clients += 1
-                except:
-                    del open_sockets[sock]
-            print("[worker] " + str(int(time.time())) + ", New block sent to: " + str(clients) + " clients")
-        time.sleep(0.1)
-    return
-
-def launch_socket_client(server):
-    client_thread = threading.Thread(target=socket_client, args=(server,))
-    client_thread.start()
-    
-    m_thread = threading.Thread(target=socket_monitor_thread, args=(client_thread,server,))
-    m_thread.start()   
-
 def eleneum_start():
     create_indexes(blocks, indices_blocks)
     create_indexes(txs, indices_transactions)
 
-    sync_blockchain(0, "pool.eleneum.org")
+    load_config('eleneum.json')
+
+    sync_blockchain(0, "eleneum.org")
     
-    x = threading.Thread(target=server_socket, args=())
-    x.start()
+    http_monitor = threading.Thread(target=peer_monitor)
+    http_monitor.daemon = True
+    http_monitor.start()
     
-    y = threading.Thread(target=process_server_sockets, args=())
-    y.start()
-    
-    launch_socket_client("pool.eleneum.org")
-    launch_socket_client("elena.yourmining.site")
-    launch_socket_client("elena.onlyapool.online")
+    try:
+        register_peer("elena.onlyapool.online")
+        register_peer("elena.yourmining.site")
+        register_peer("pool.eleneum.org")
+        register_peer("eleneum.org")
+    except Exception as e:
+        print(e)
     
     run()
 
