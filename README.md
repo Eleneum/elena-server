@@ -29,6 +29,13 @@ cd elena-server
 nano eleneum.json
 ```
 
+#### Private key creation
+If you doesn't have a private key, you can create a new one running:
+
+```bash
+python3 create_address.py
+```
+
 ### Running the server
 Currently, the program cannot function as a daemon. Therefore, it is best to run it within a screen session:
 
