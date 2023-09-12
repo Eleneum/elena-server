@@ -18,6 +18,7 @@ from Crypto.Hash import keccak
 import math
 import traceback
 from bson import json_util
+import random
 
 import rlp
 from eth_typing import HexStr
@@ -381,6 +382,7 @@ def http_client(server):
     last_id = actualblock
     last_mempool = 0
     mempooltxs = 0
+    mempooltimer = random.randint(0, 59)
     while True:
         try:
             t = int(time.time())
@@ -389,7 +391,7 @@ def http_client(server):
                 url = "http://" + server + ":9090/notifyblock"
                 response = requests.post(url, data=hdata, timeout=5)
                 last_id = actualblock
-            if t != last_mempool and t % 60 == 0:
+            if t != last_mempool and t % 60 == int(mempooltimer):
                 last_mempool = t
                 mempooltxs = 0
                 url = "http://" + server + ":9090/getmempool"
