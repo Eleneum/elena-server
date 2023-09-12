@@ -20,6 +20,7 @@ pip3 install pymongo pycryptodomex web3 ethereum
 pip3 install git+https://github.com/Eleneum/pyrx
 ```
 
+### Configuration
 Edit the 'eleneum.json' file and paste your private key (without the '0x' prefix), then launch the server.
 
 ```bash
@@ -28,6 +29,7 @@ cd elena-server
 nano eleneum.json
 ```
 
+### Running the server
 Currently, the program cannot function as a daemon. Therefore, it is best to run it within a screen session:
 
 ```bash
