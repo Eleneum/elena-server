@@ -937,12 +937,6 @@ class S(BaseHTTPRequestHandler):
                 result_list.append(result)
             json_output = json.loads(json_util.dumps({"id": 1, "status": "ok", "result": result_list}))
             self.wfile.write(json.dumps(json_output).encode('utf-8'))
-        if str(self.path) == "/version":
-            self._set_response()
-            self.wfile.write("{version: '1.0', block: 1, chainID: 666, chainHash: '0x00000000001bad'}".encode('utf-8'))
-            myquery = { "ip": "127.0.0.1" }
-            peers.delete_many(myquery)
-            r = peers.insert_one( { 'ip': '127.0.0.1', 'port': '9090', 'block': 1, 'status': 'ok'  })
         if str(self.path) == "/mineblock":
             z = blocks.find_one(sort=[("height", -1)])
             try:
